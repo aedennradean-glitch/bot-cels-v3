@@ -72,7 +72,7 @@ function envSnowflake(name) {
 // CONFIG
 // =====================================================
 
-const DEFAULT_GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.1-flash-lite"];
+const DEFAULT_GEMINI_MODELS = ["gemini-3.5-flash", "gemini-3.8-flash", "gemini-3.5-flash-lite", "gemini-3.1-flash-lite"];
 const ENV_MODELS = (process.env.GEMINI_MODELS || "").split(",").map((s) => s.trim()).filter(Boolean);
 const GEMINI_MODELS = ENV_MODELS.length > 0 ? ENV_MODELS : DEFAULT_GEMINI_MODELS;
 
@@ -107,7 +107,7 @@ const LIMITS = {
   aiTimeoutMs: envInt("AI_TIMEOUT_MS", 25000, 5000, 60000),
   aiMaxConcurrent: 2,
   aiMaxPerMinute: 12,
-  aiMaxModelAttempts: 3,
+  aiMaxModelAttempts: 4,
   aiMaxOutputTokens: 512,
   userCooldownMs: 8000,
   channelCooldownMs: 3000,
@@ -873,17 +873,50 @@ function changeMood() {
 class GeminiProvider {
   constructor(apiKey, models) {
     this.apiKey = apiKey;
-    this.models = models;
+    this.models = [...new Set(models.map((m) => String(m).trim()).filter(Boolean))].slice(0, 4);
     this.modelBlockedUntil = new Map();
+    this.modelStats = new Map(this.models.map((model) => [model, {
+      attempts: 0, successes: 0, failures: 0, lastStatus: "belum dites",
+      lastError: "", lastLatencyMs: 0, lastAttemptAt: 0, lastSuccessAt: 0,
+      status: "belum dites",
+    }]));
     this.globalBlockedUntil = 0;
     this.consecutiveFailures = 0;
     this.lastError = "";
     this.lastOkAt = 0;
     this.lastOkModel = "";
+    this.currentModel = "";
+    this.lastHttpStatus = 0;
+    this.lastLatencyMs = 0;
+    this.lastFallbackCount = 0;
+    this.totalFallbacks = 0;
+    this.apiStatus = apiKey ? "belum dites" : "API key kosong";
+    this.authBlocked = false;
   }
 
-  isAvailable() { return Date.now() >= this.globalBlockedUntil; }
-  blockModel(model, ms) { this.modelBlockedUntil.set(model, Date.now() + ms); }
+  isAvailable() { return !this.authBlocked && Date.now() >= this.globalBlockedUntil; }
+  blockModel(model, ms) {
+    this.modelBlockedUntil.set(model, Date.now() + ms);
+    const stats = this.modelStats.get(model);
+    if (stats) stats.status = `cooldown ${Math.ceil(ms / 1000)} dtk`;
+  }
+  modelStatus(model) {
+    const until = this.modelBlockedUntil.get(model) || 0;
+    if (until > Date.now()) return `cooldown ${Math.ceil((until - Date.now()) / 1000)} dtk`;
+    return this.modelStats.get(model)?.status || "tidak diketahui";
+  }
+  diagnostics() {
+    return this.models.map((model) => {
+      const s = this.modelStats.get(model) || {};
+      return {
+        model, status: this.modelStatus(model), attempts: s.attempts || 0,
+        successes: s.successes || 0, failures: s.failures || 0,
+        lastStatus: s.lastStatus || "-", lastError: s.lastError || "",
+        lastLatencyMs: s.lastLatencyMs || 0,
+        cooldownUntil: this.modelBlockedUntil.get(model) || 0,
+      };
+    });
+  }
 
   buildConfig(model, opts = {}) {
     const config = {
@@ -892,8 +925,8 @@ class GeminiProvider {
     };
     if (/^gemini-2\.5-flash/i.test(model)) {
       config.thinkingConfig = { thinkingBudget: 0 };
-    } else {
-      // Seri 3.x "berpikir" dulu dan jatahnya ikut memakan output token.
+    } else if (/^gemini-3\./i.test(model)) {
+      // Pertahankan ruang output yang dipakai implementasi Cels sebelumnya untuk seri Gemini 3.
       config.maxOutputTokens = Math.max(config.maxOutputTokens, 2048);
     }
     if (opts.json) config.responseMimeType = "application/json";
@@ -903,7 +936,8 @@ class GeminiProvider {
   async callModel(model, system, user, opts = {}) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), LIMITS.aiTimeoutMs);
-
+    const startedAt = Date.now();
+    this.lastHttpStatus = 0;
     try {
       const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
       const response = await fetch(url, {
@@ -916,114 +950,172 @@ class GeminiProvider {
         }),
         signal: controller.signal,
       });
-
+      this.lastHttpStatus = response.status;
       if (!response.ok) {
-        await response.text().catch(() => "");
-        const error = new Error(`HTTP ${response.status}`);
+        const body = await response.text().catch(() => "");
+        const error = new Error(`HTTP ${response.status}${body ? `: ${body.slice(0, 300)}` : ""}`);
         error.status = response.status;
         throw error;
       }
-
       const data = await response.json();
       const candidate = data?.candidates?.[0];
       const parts = candidate?.content?.parts;
       const text = Array.isArray(parts)
         ? parts.map((part) => (typeof part?.text === "string" ? part.text : "")).join("").trim()
         : "";
-
       if (!text) {
         const why = candidate?.finishReason || data?.promptFeedback?.blockReason || "tanpa teks";
         const error = new Error(`respons kosong (${why})`);
         error.status = 0;
+        error.emptyResponse = true;
         throw error;
       }
       return text;
+    } catch (error) {
+      if (error.name === "AbortError") error.isTimeout = true;
+      throw error;
     } finally {
+      this.lastLatencyMs = Date.now() - startedAt;
       clearTimeout(timer);
     }
   }
 
-  // Return teks, atau null (alasannya ada di this.lastError).
   async generate(system, user, opts = {}) {
-    if (!this.isAvailable()) {
-      this.lastError = `AI dijeda ${Math.ceil((this.globalBlockedUntil - Date.now()) / 1000)} dtk (backoff setelah kegagalan)`;
+    this.lastFallbackCount = 0;
+    if (this.authBlocked) {
+      this.lastError = "API Gemini diblokir karena autentikasi (401/403); periksa GEMINI_API_KEY dan akses project.";
+      return null;
+    }
+    if (Date.now() < this.globalBlockedUntil) {
+      this.lastError = `AI dijeda ${Math.ceil((this.globalBlockedUntil - Date.now()) / 1000)} dtk (backoff global).`;
       return null;
     }
 
-    const now = Date.now();
-    const candidates = this.models
-      .filter((model) => (this.modelBlockedUntil.get(model) || 0) <= now)
-      .slice(0, LIMITS.aiMaxModelAttempts);
-
-    if (candidates.length === 0) {
-      this.lastError = "semua model sedang diblokir sementara (cek nama model / GEMINI_MODELS)";
-      logWarn("AI", this.lastError);
+    // Prioritas tetap mengikuti GEMINI_MODELS. Model yang cooldown dilewati tanpa diulang.
+    const candidates = this.models.filter((model) => (this.modelBlockedUntil.get(model) || 0) <= Date.now()).slice(0, LIMITS.aiMaxModelAttempts);
+    if (!candidates.length) {
+      this.lastError = "semua model sedang cooldown/tidak tersedia sementara.";
       return null;
     }
 
+    const attempted = new Set();
     const errors = [];
-
-    for (let i = 0; i < candidates.length; i++) {
+    for (let i = 0; i < candidates.length && attempted.size < LIMITS.aiMaxModelAttempts; i++) {
       const model = candidates[i];
+      if (attempted.has(model)) continue;
+      attempted.add(model);
+      this.currentModel = model;
+      const stats = this.modelStats.get(model);
+      if (stats) { stats.attempts++; stats.lastAttemptAt = Date.now(); stats.status = "sedang digunakan"; }
 
       try {
         const text = await this.callModel(model, system, user, opts);
+        if (stats) {
+          stats.successes++; stats.lastStatus = "OK"; stats.lastError = "";
+          stats.lastLatencyMs = this.lastLatencyMs; stats.lastSuccessAt = Date.now(); stats.status = "tersedia";
+        }
         this.consecutiveFailures = 0;
         this.lastOkAt = Date.now();
         this.lastOkModel = model;
         this.lastError = "";
+        this.apiStatus = "aktif";
+        this.authBlocked = false;
         return text;
       } catch (error) {
-        const status = error.status;
-        const aborted = error.name === "AbortError";
-        const label = aborted ? "timeout" : status ? `HTTP ${status}` : error.message;
+        const status = Number(error.status) || 0;
+        const label = error.isTimeout ? "timeout" : status ? `HTTP ${status}` : sanitize(error.message || error);
         errors.push(`${model}: ${label}`);
-        logError("AI", `${model} gagal: ${label}`);
+        if (stats) {
+          stats.failures++; stats.lastStatus = status ? `HTTP ${status}` : label;
+          stats.lastError = truncate(label, 180); stats.lastLatencyMs = this.lastLatencyMs;
+          stats.status = "gagal";
+        }
+        logError("AI", `${model} gagal (${label}); latency=${this.lastLatencyMs}ms`);
 
         if (status === 401 || status === 403) {
+          this.authBlocked = true;
+          this.apiStatus = `akses ditolak HTTP ${status}`;
           this.consecutiveFailures++;
-          this.globalBlockedUntil = Date.now() + 10 * 60 * 1000;
-          this.lastError = `API key/akses ditolak (HTTP ${status}); AI dijeda 10 menit`;
+          this.lastError = `API key/akses ditolak (HTTP ${status}); fallback dihentikan.`;
+          logError("AI", this.lastError);
           return null;
         }
 
-        // Blokir model dibatasi singkat supaya salah nama / gangguan sesaat tidak membungkam bot berjam-jam.
-        if (status === 404) this.blockModel(model, 30 * 60 * 1000);
-        else if (status === 400) this.blockModel(model, 10 * 60 * 1000);
-        else if (status === 429) this.blockModel(model, 60 * 1000);
-        else this.blockModel(model, 30 * 1000);
+        if (status === 404) {
+          this.blockModel(model, 30 * 60 * 1000);
+          if (stats) stats.status = "tidak ditemukan (cooldown 30 menit)";
+        } else if (status === 429) {
+          this.blockModel(model, 60 * 1000);
+        } else if (status === 400) {
+          this.blockModel(model, 5 * 60 * 1000);
+        } else {
+          this.blockModel(model, error.isTimeout ? 30 * 1000 : 20 * 1000);
+        }
 
-        if ((status === 429 || status === 500 || status === 503) && i < candidates.length - 1) {
-          await sleep(400 * 2 ** i);
+        const retryable = error.isTimeout || error.emptyResponse || status === 0 ||
+          status === 404 || status === 429 || status === 500 || status === 502 ||
+          status === 503 || status === 504 || status >= 500;
+        if (!retryable && status >= 400 && status < 500) {
+          this.lastError = `${model} ditolak HTTP ${status}; tidak ada fallback untuk error request permanen.`;
+          this.apiStatus = `error request HTTP ${status}`;
+          return null;
+        }
+
+        if (i < candidates.length - 1 && attempted.size < LIMITS.aiMaxModelAttempts) {
+          this.lastFallbackCount++;
+          this.totalFallbacks++;
+          await sleep(Math.min(250 * (2 ** i), 1000));
         }
       }
     }
 
     this.consecutiveFailures++;
-    const backoff = Math.min(30 * 1000 * 2 ** (this.consecutiveFailures - 1), 10 * 60 * 1000);
+    const backoff = Math.min(15 * 1000 * 2 ** (this.consecutiveFailures - 1), 5 * 60 * 1000);
     this.globalBlockedUntil = Date.now() + backoff;
-    this.lastError = `semua model gagal (${errors.join("; ")}); AI dijeda ${Math.round(backoff / 1000)} dtk`;
+    this.lastError = `semua model gagal (${errors.join("; ")}); backoff ${Math.round(backoff / 1000)} dtk`;
+    this.apiStatus = "gangguan sementara";
     logWarn("AI", this.lastError);
     return null;
   }
 
-  // Tes langsung tiap model (mengabaikan blokir). Dipakai saat boot dan /celsadmin tes_ai.
   async probe() {
     const results = [];
     for (const model of this.models) {
+      const startedAt = Date.now();
+      this.currentModel = model;
+      const stats = this.modelStats.get(model);
+      if (stats) { stats.attempts++; stats.lastAttemptAt = startedAt; }
       try {
-        await this.callModel(model, "Balas satu kata saja.", "Tes koneksi. Balas: OK", { maxOutputTokens: 64, temperature: 0 });
+        await this.callModel(model, "Balas satu kata saja.", "Tes koneksi. Balas: OK", { maxOutputTokens: 32, temperature: 0 });
         this.modelBlockedUntil.delete(model);
-        results.push({ model, ok: true, error: "" });
+        if (stats) {
+          stats.successes++; stats.lastStatus = "OK"; stats.lastError = "";
+          stats.lastLatencyMs = Date.now() - startedAt; stats.lastSuccessAt = Date.now(); stats.status = "tersedia";
+        }
+        results.push({ model, ok: true, error: "", latencyMs: Date.now() - startedAt });
       } catch (error) {
-        const label = error.name === "AbortError" ? "timeout" : error.status ? `HTTP ${error.status}` : error.message;
-        results.push({ model, ok: false, error: label });
+        const status = Number(error.status) || 0;
+        const label = error.isTimeout ? "timeout" : status ? `HTTP ${status}` : sanitize(error.message || error);
+        if (stats) {
+          stats.failures++; stats.lastStatus = status ? `HTTP ${status}` : label;
+          stats.lastError = truncate(label, 180); stats.lastLatencyMs = Date.now() - startedAt;
+          stats.status = status === 404 ? "tidak ditemukan" : "gagal";
+        }
+        if (status === 404) this.blockModel(model, 30 * 60 * 1000);
+        if (status === 401 || status === 403) {
+          this.authBlocked = true;
+          this.apiStatus = `akses ditolak HTTP ${status}`;
+        }
+        results.push({ model, ok: false, error: label, latencyMs: Date.now() - startedAt, status });
+        if (status === 401 || status === 403) break;
       }
     }
     if (results.some((r) => r.ok)) {
       this.globalBlockedUntil = 0;
       this.consecutiveFailures = 0;
-    }
+      this.authBlocked = false;
+      this.apiStatus = "aktif";
+    } else if (!this.authBlocked) this.apiStatus = "tidak ada model yang lolos tes";
     return results;
   }
 }
@@ -1878,10 +1970,12 @@ function schedulerHealthy() {
 
 function schedulerWatchdog() {
   if (shuttingDown) return;
-  if (schedulerHealthy()) return;
-  logWarn("AUTOCHAT", "Watchdog: scheduler tidak sehat, dihidupkan ulang.");
-  tickRunning = false;
-  if (schedulerTimer) { clearTimeout(schedulerTimer); schedulerTimer = null; }
+  if (tickRunning) {
+    logWarn("AUTOCHAT", `Watchdog: tick masih berjalan selama ${fmtDur(Date.now() - tickStartedAt)}; tidak membuat scheduler kedua.`);
+    return;
+  }
+  if (schedulerTimer) return;
+  logWarn("AUTOCHAT", "Watchdog: scheduler tidak memiliki timer, dihidupkan ulang.");
   startScheduler(5 * 1000);
 }
 
@@ -2023,6 +2117,8 @@ function diagnosticsText() {
     `Alasan diam teratas: ${top}`,
     `Tidur: ${isSleeping() ? sleepText() : "tidak"} | pesan spontan berturut-turut belum dibalas: ${autonomyState.unansweredStreak}`,
     `Model: ${probe}`,
+    `Gemini: ${provider ? `${provider.apiStatus} | aktif=${provider.currentModel || "-"} | terakhir sukses=${provider.lastOkModel || "-"} | fallback terakhir=${provider.lastFallbackCount} | total fallback=${provider.totalFallbacks} | HTTP=${provider.lastHttpStatus || "-"}` : "provider tidak tersedia"}`,
+    ...(provider ? provider.diagnostics().map((m) => `• ${m.model}: ${m.status} | sukses ${m.successes} / gagal ${m.failures} | HTTP ${m.lastStatus} | ${m.lastLatencyMs}ms`) : []),
   ].join("\n");
 }
 
@@ -2037,8 +2133,12 @@ function adminStatusText() {
   return truncate(
     `⚙️ **CELS ADMIN**\n${lines.join("\n")}\n` +
       `Voice: **${voiceStatus}** | AI: **${aiStatus}** | Main chat: **${mainChatStatusText()}** | Tanya-jawab: **${QA_CHANNEL_ID ? "<#" + QA_CHANNEL_ID + ">" : "semua channel"}**\n` +
-      `Penyimpanan: **${storage}** | ${brainMemory.messages.length} pesan tersimpan\n\n` +
-      `🤖 **AUTONOMOUS DIAGNOSTIK**\n${diagnosticsText()}`,
+      `Penyimpanan: **${storage}** | ${brainMemory.messages.length} pesan tersimpan\n` +
+      (provider
+        ? `\n🧠 **GEMINI FAILOVER**\nAPI: ${provider.apiStatus} | aktif: ${provider.currentModel || "-"} | terakhir sukses: ${provider.lastOkModel || "-"}\nFallback: ${provider.lastFallbackCount} terakhir / ${provider.totalFallbacks} total | HTTP: ${provider.lastHttpStatus || "-"} | ${provider.lastLatencyMs}ms\n` +
+          provider.diagnostics().map((m) => `• ${m.model}: ${m.status}, sukses ${m.successes}, gagal ${m.failures}, ${m.lastStatus}, ${m.lastLatencyMs}ms`).join("\n") + "\n"
+        : "\n🧠 **GEMINI FAILOVER**\nProvider tidak aktif (GEMINI_API_KEY kosong).\n") +
+      `\n🤖 **AUTONOMOUS DIAGNOSTIK**\n${diagnosticsText()}`,
     1950
   );
 }
@@ -2190,7 +2290,7 @@ async function onMessageCreate(message) {
     // Permintaan memory eksplisit
     const rememberMatch = rawContent.match(/^cels[,:]?\s*(?:ingat|inget|remember)\s+(.+)/is);
     if (rememberMatch) {
-      if (!cooldowns.ready(`user:${userId}`, LIMITS.userCooldownMs)) return;
+      if (!cooldowns.ready(`remember:${userId}`, LIMITS.userCooldownMs)) return;
       const saved = memories.addUserFact(userId, rememberMatch[1], "message");
       if (saved) await safeReply(message, "iya, gue inget. jangan nyuruh gue inget terus nanti otak gue penuh 😭");
       return;
@@ -2202,8 +2302,8 @@ async function onMessageCreate(message) {
 
     if (mentioned) {
       if (!reactiveAllowed(message.channel.id)) return;
+      // Cooldown per-user saja: satu member tidak boleh memblokir balasan untuk seluruh channel.
       if (!cooldowns.ready(`user:${userId}`, LIMITS.userCooldownMs)) return;
-      if (!cooldowns.ready(`ch:${message.channel.id}`, LIMITS.channelCooldownMs)) return;
 
       autoChat.mentionsInFlight++;
       let result;
@@ -2446,14 +2546,26 @@ async function onInteraction(interaction) {
       return;
     }
   } catch (error) {
+    const discordCode = Number(error?.code || error?.rawError?.code || 0);
+    if (discordCode === 10062) {
+      logWarn("DISCORD", "Unknown Interaction (10062): token interaction kedaluwarsa; tidak mencoba reply ulang.");
+      return;
+    }
+    if (discordCode === 40060) {
+      logWarn("DISCORD", "Interaction sudah di-acknowledge (40060); tidak mencoba reply ulang.");
+      return;
+    }
     logError("DISCORD", "Interaction error:", error);
     try {
-      if (interaction.isRepliable()) {
-        const payload = { content: "💀 Cels error. bentar.", flags: EPHEMERAL };
-        if (interaction.replied || interaction.deferred) await interaction.followUp(payload);
-        else await interaction.reply(payload);
+      if (interaction.isRepliable() && !interaction.replied && !interaction.deferred) {
+        await interaction.reply({ content: "💀 Cels error. bentar.", flags: EPHEMERAL });
+      } else if (interaction.isRepliable() && (interaction.replied || interaction.deferred)) {
+        await interaction.followUp({ content: "💀 Cels error. bentar.", flags: EPHEMERAL });
       }
-    } catch {}
+    } catch (replyError) {
+      const code = Number(replyError?.code || replyError?.rawError?.code || 0);
+      if (code !== 10062 && code !== 40060) logWarn("DISCORD", "Gagal mengirim diagnostik interaction:", replyError);
+    }
   }
 }
 client.on("interactionCreate", onInteraction);
