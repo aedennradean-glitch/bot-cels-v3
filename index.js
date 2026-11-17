@@ -98,6 +98,8 @@ const CELS_ADMIN_ROLE_NAME = "redflagfinalboss";
 const CELS_ADMIN_ROLE_ID = envSnowflake("CELS_ADMIN_ROLE_ID");
 
 // Voice
+// Server tempat Cels AFK di voice. Kosong = sama dengan GUILD_ID (server chat). Isi kalau voice dan chat ada di server berbeda.
+const VOICE_GUILD_ID = envSnowflake("VOICE_GUILD_ID") || GUILD_ID;
 const VOICE_MAX_RECONNECT = envInt("VOICE_MAX_RECONNECT", 10, 1, 100);                                   // percobaan reconnect beruntun sebelum menyerah
 const VOICE_GIVEUP_RETRY_MS = envInt("VOICE_GIVEUP_RETRY_MINUTES", 15, 1, 1440) * 60 * 1000;             // MENIT: setelah menyerah, watchdog hanya mencoba 1x per jeda ini
 const VOICE_CONNECT_TIMEOUT_MS = 30 * 1000;
@@ -479,6 +481,7 @@ if (!SNOWFLAKE_RE.test(GUILD_ID)) { logError("BOOT", "GUILD_ID formatnya salah (
 if (!SNOWFLAKE_RE.test(CHANNEL_ID)) { logError("BOOT", "CHANNEL_ID formatnya salah (harus angka 17-20 digit)."); process.exit(1); }
 
 log("BOOT", `Pemilik bot dikenali dari ${OWNER_SOURCE}.`);
+log("BOOT", VOICE_GUILD_ID === GUILD_ID ? "Server voice = server chat (GUILD_ID)." : `Mode dua server: chat/main chat di GUILD_ID, voice di VOICE_GUILD_ID (${VOICE_GUILD_ID}).`);
 if (!MYOO_USER_ID) logWarn("BOOT", "MYOO_USER_ID belum diisi. Isi dengan ID Discord pemilik supaya perintah owner tidak bergantung pada nilai bawaan kode.");
 if (!GEMINI_API_KEY) logWarn("BOOT", "GEMINI_API_KEY kosong. AI dimatikan, bot tetap jalan tanpa AI (tidak ada chat spontan).");
 if (!STORE_PATH_CONFIGURED) {
@@ -511,6 +514,7 @@ const {
   getVoiceConnection,
   VoiceConnectionStatus,
   entersState,
+  generateDependencyReport,
 } = require("@discordjs/voice");
 
 const client = new Client({
@@ -1351,12 +1355,25 @@ function disconnectVoice() {
   const current = voice.connection;
   voice.connection = null;
   destroyConnectionSafe(current);
-  const stray = getVoiceConnection(GUILD_ID);
+  const stray = getVoiceConnection(VOICE_GUILD_ID);
   if (stray) destroyConnectionSafe(stray);
 }
 
 function attachVoiceHandlers(connection) {
-  connection.on("stateChange", (oldState, newState) => { log("VOICE", `${oldState.status} -> ${newState.status}`); });
+  connection.on("stateChange", (oldState, newState) => {
+    log("VOICE", `${oldState.status} -> ${newState.status}`);
+    // Detail tahap networking supaya kelihatan macet di mana (0 ws, 1 identify, 2 UDP handshake, 3 select protocol, 4 ready).
+    // Kode penutupan 4017 = Discord menolak karena enkripsi DAVE tidak didukung (library/Node terlalu lama).
+    try {
+      const oldNet = Reflect.get(oldState, "networking");
+      const newNet = Reflect.get(newState, "networking");
+      if (newNet && newNet !== oldNet) {
+        newNet.on("stateChange", (o, n) => log("VOICE", `networking tahap ${o.code} -> ${n.code}`));
+        newNet.on("close", (code) => log("VOICE", `networking ditutup Discord, kode ${code}`));
+        newNet.on("error", (error) => logError("VOICE", "Networking error:", error));
+      }
+    } catch {}
+  });
   connection.on("error", (error) => { logError("VOICE", "Connection error:", error); });
 
   connection.on(VoiceConnectionStatus.Disconnected, async () => {
@@ -1384,6 +1401,20 @@ function attachVoiceHandlers(connection) {
   });
 }
 
+// Diagnosis spesifik kenapa target voice tidak bisa dipakai + daftar voice channel yang terlihat bot (ID bukan rahasia).
+async function describeVoiceProblem(guild, channelId) {
+  const raw = await guild.channels.fetch(channelId).catch(() => null);
+  await guild.channels.fetch().catch(() => null);
+  const voices = [...guild.channels.cache.values()]
+    .filter((c) => typeof c.isVoiceBased === "function" && c.isVoiceBased())
+    .slice(0, 15).map((c) => `#${c.name}=${c.id}`).join(", ") || "(tidak ada yang terlihat)";
+  const why = !raw
+    ? `ID ${channelId} tidak ada di server voice ini (salah ID / channel di server lain) atau bot tidak punya izin View Channel`
+    : `ID ${channelId} adalah #${raw.name} tapi BUKAN voice channel (tipe ${raw.type})`;
+  logError("VOICE", `${why}. Voice channel yang terlihat oleh bot: ${voices}`);
+  return why;
+}
+
 // Return { ok: true, channelName } atau { ok: false, error }. Tidak pernah melempar error.
 //   manual = true  : dipanggil oleh perintah owner/admin; boleh menggantikan percobaan lain yang sedang berjalan.
 //   manual = false : dipanggil oleh watchdog/reconnect; mengalah kalau sudah ada percobaan lain.
@@ -1399,8 +1430,8 @@ async function connectToVC({ reason = "auto", manual = false } = {}) {
   let connection = null;
 
   try {
-    const guild = client.guilds.cache.get(GUILD_ID);
-    if (!guild) throw new Error(`guild tidak ditemukan: ${GUILD_ID}`);
+    const guild = client.guilds.cache.get(VOICE_GUILD_ID);
+    if (!guild) throw new Error(`bot tidak ada di server voice (VOICE_GUILD_ID/GUILD_ID): ${VOICE_GUILD_ID}`);
 
     let channel = await fetchVoiceChannel(guild, getActiveVoiceChannelId());
     if (!channel && voiceState.targetChannelId && voiceState.targetChannelId !== CHANNEL_ID) {
@@ -1408,7 +1439,7 @@ async function connectToVC({ reason = "auto", manual = false } = {}) {
       setVoiceTarget("");
       channel = await fetchVoiceChannel(guild, CHANNEL_ID);
     }
-    if (!channel) throw new Error(`voice channel tidak ditemukan atau bukan voice channel: ${getActiveVoiceChannelId()}`);
+    if (!channel) throw new Error(await describeVoiceProblem(guild, getActiveVoiceChannelId()));
     if (superseded()) return { ok: false, error: "dibatalkan oleh perintah yang lebih baru" };
 
     const me = guild.members.me || (await guild.members.fetchMe().catch(() => null));
@@ -1421,13 +1452,13 @@ async function connectToVC({ reason = "auto", manual = false } = {}) {
     const old = voice.connection;
     voice.connection = null;
     destroyConnectionSafe(old);
-    const stray = getVoiceConnection(GUILD_ID);
+    const stray = getVoiceConnection(VOICE_GUILD_ID);
     if (stray) destroyConnectionSafe(stray);
 
     log("VOICE", `Menyambung ke #${channel.name} (${channel.id}) [${reason}]`);
     connection = joinVoiceChannel({
       channelId: channel.id,
-      guildId: GUILD_ID,
+      guildId: VOICE_GUILD_ID,
       adapterCreator: guild.voiceAdapterCreator,
       selfDeaf: false,
       selfMute: false,
@@ -1471,7 +1502,7 @@ async function connectToVC({ reason = "auto", manual = false } = {}) {
 function voiceWatchdog() {
   if (shuttingDown) return;
 
-  const connection = getVoiceConnection(GUILD_ID);
+  const connection = getVoiceConnection(VOICE_GUILD_ID);
 
   if (!settings.voiceEnabled) {
     if (voice.connection || connection) {
@@ -1493,7 +1524,7 @@ function voiceWatchdog() {
   }
 
   const target = getActiveVoiceChannelId();
-  const me = client.guilds.cache.get(GUILD_ID)?.members?.me;
+  const me = client.guilds.cache.get(VOICE_GUILD_ID)?.members?.me;
   const currentChannelId = me?.voice?.channelId;
   const status = connection?.state?.status;
 
@@ -1745,14 +1776,15 @@ async function executeOwnerCommand(cmd, message) {
         : "gue emang lagi nggak di voice.";
     }
     case "voice_join": {
-      const guild = message.guild;
-      if (!guild) return "perintah voice cuma bisa di dalam server.";
+      const guild = client.guilds.cache.get(VOICE_GUILD_ID);
+      if (!guild) return "gue nggak ada di server voice (cek VOICE_GUILD_ID / GUILD_ID).";
       try { await message.channel.sendTyping?.(); } catch {}
 
       let channel = null;
       if (cmd.mentionIds.length === 0 && !cmd.query) {
         // "cels masuk voice" tanpa nama: pakai voice tempat owner berada, kalau tidak ada pakai target tersimpan/default.
-        channel = message.member?.voice?.channel || (await fetchVoiceChannel(guild, getActiveVoiceChannelId()));
+        const ownVc = message.guild?.id === VOICE_GUILD_ID ? message.member?.voice?.channel : null;
+        channel = ownVc || (await fetchVoiceChannel(guild, getActiveVoiceChannelId()));
         if (!channel) return "gue nggak tahu mau masuk voice yang mana. sebut namanya atau mention channel-nya.";
         const me = guild.members?.me;
         const problem = joinProblem(guild, channel, me);
@@ -2869,6 +2901,8 @@ async function onReady() {
   BOOT_AT_REF.value = Date.now();
 
   log("DISCORD", `Cels online sebagai ${client.user.tag}`);
+  log("BOOT", `Node ${process.version}`);
+  try { if (typeof generateDependencyReport === "function") log("VOICE", `Dependency report:\n${generateDependencyReport()}`); } catch {}
 
   await registerCommands();
   checkAdminRole(client.guilds.cache.get(GUILD_ID));
@@ -3100,7 +3134,7 @@ client.on("messageDelete", (message) => {
 // Channel yang dipakai (voice target / main chat) terhapus.
 client.on("channelDelete", (channel) => {
   try {
-    if (!channel || channel.guildId !== GUILD_ID) return;
+    if (!channel || (channel.guildId !== GUILD_ID && channel.guildId !== VOICE_GUILD_ID)) return;
 
     if (channel.id === MAIN_CHAT_CHANNEL_ID) {
       logWarn("AUTOCHAT", "Main chat channel terhapus.");
@@ -3131,7 +3165,7 @@ client.on("channelDelete", (channel) => {
 client.on("voiceStateUpdate", async (oldState, newState) => {
   try {
     if (newState.id === client.user?.id) {
-      if (newState.guild?.id !== GUILD_ID) return;
+      if (newState.guild?.id !== VOICE_GUILD_ID) return;
       if (oldState.channelId !== newState.channelId) {
         log("VOICE", `Posisi voice Cels: ${oldState.channelId || "-"} -> ${newState.channelId || "-"}`);
         // Dipindah/ditarik ke channel yang bukan target, atau dikeluarkan, saat Cels memang diminta berada di voice.
